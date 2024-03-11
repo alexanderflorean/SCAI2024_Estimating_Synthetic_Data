@@ -17,7 +17,7 @@ from sdmetrics.single_table.multi_column_pairs import (ContinuousKLDivergence,
 from sdmetrics.single_table.multi_single_column import CSTest, KSComplement
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 from utils import timefunction
@@ -29,6 +29,7 @@ def compute_propensity(
     synthetic_data: pd.DataFrame,
     custom_metadata: dict,
     random_state=None,
+    n_splits: int = 10
 ) -> dict:
     """
     Uses Logistic Regression from sklearn to compute the propensity
@@ -46,7 +47,9 @@ def compute_propensity(
         classifier: scikit-learn classifier
         random_state: int, optional, default: None
             Controls the random state for train_test_split
-
+        n_splits: int, default: 10
+            The number of K-fold splits used when computing the stratified
+            k-fold cross-validation.
 
     Returns:
         --------
@@ -77,17 +80,8 @@ def compute_propensity(
     # Combine original_data and synthetic_data
     combined_data = pd.concat([original_data, synthetic_data], axis=0)
     Z = combined_data.drop(columns="S")  # remove target label
-    # Set as string for preprocessor
-    Z[custom_metadata['target']] = Z[custom_metadata['target']].astype(str)
+    Z[custom_metadata['target']] = Z[custom_metadata['target']].astype(str)  # Set as string for preprocessor
     Y = combined_data["S"]  # target label
-
-    # train-test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        Z, Y, train_size=0.7, random_state=random_state
-    )
-
-    n_o_test = sum(y_test == 0)  # number of original samples in the test data
-    n_s_test = sum(y_test == 1)  # number of synthetic samples in the test data
 
     # copy and set the target label as a categorical feature for the model and preprocessor
     meta = deepcopy(custom_metadata)
@@ -96,21 +90,44 @@ def compute_propensity(
     else:
         meta["categorical_features"]= [meta['target']]
 
-    # create and fit the preprocessor to the training data
-    preprocessor = create_preprocessing_pipeline(meta)
-    preprocessor.fit(X_train)
+    no_test = []
+    ns_test = []
+    scores = []
 
-    # Transform the data
-    X_train_transformed = preprocessor.transform(X_train)
-    X_test_transformed = preprocessor.transform(X_test)
+    kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    # fit Logistic Regression model and compute propensity scores
-    classifier.fit(X=X_train_transformed, y=y_train)
+    for train_index, test_index in kfold.split(Z, Y):
+        X_train, X_test = Z.iloc[train_index], Z.iloc[test_index]
+        y_train, y_test = Y.iloc[train_index], Y.iloc[test_index]
 
-    # Extract probabilities for class 1 (synthetic) on X_test datapoints
-    score =  classifier.predict_proba(X_test_transformed)[:, 1]
+        no_test.append(sum(y_test == 0) )  # number of original samples in the test data
+        ns_test.append(sum(y_test == 1) )  # number of synthetic samples in the test data
 
-    return {"score": score, "no": n_o_test, "ns": n_s_test}
+        # create and fit the preprocessor to the training data
+        preprocessor = create_preprocessing_pipeline(meta)
+        preprocessor.fit(X_train)
+
+        # Transform the data
+        X_train_transformed = preprocessor.transform(X_train)
+        X_test_transformed = preprocessor.transform(X_test)
+
+        # fit Logistic Regression model and compute propensity scores
+        classifier.fit(X=X_train_transformed, y=y_train)
+
+        # Extract probabilities for class 1 (synthetic) on X_test datapoints
+        prob =  classifier.predict_proba(X_test_transformed)[:, 1]
+
+        N = no_test[-1] + ns_test[-1]
+        c = ns_test[-1] / N  # proportion of # synthetic samples in the test data
+
+        pmse_score = (1/N) * sum((prob - c) ** 2) 
+        scores.append(pmse_score)
+    
+    return {
+        "score": np.mean(pmse_score) 
+        ,"no": np.mean(no_test)
+        ,"ns": np.mean(ns_test)
+        }
 
 
 @timefunction
@@ -137,15 +154,16 @@ def pmse(
     prop_dict = compute_propensity(original_data, synthetic_data, custom_metadata)
 
     propensity = prop_dict["score"]
+    return propensity
 
-    n_o = prop_dict["no"]  # number of samples from original data
-    n_s = prop_dict["ns"]  # number of samples from synthetic data
-    N = n_o + n_s
-    c = n_s / N  # proportion of # synthetic samples in the test data
+    #n_o = prop_dict["no"]  # number of samples from original data
+    #n_s = prop_dict["ns"]  # number of samples from synthetic data
+    #N = n_o + n_s
+    #c = n_s / N  # proportion of # synthetic samples in the test data
 
-    pmse_score = (1/N) * sum((propensity - c) ** 2) 
+    #pmse_score = (1/N) * sum((propensity - c) ** 2) 
 
-    return pmse_score
+    #return pmse_score
 
 
 @timefunction
